@@ -2,7 +2,7 @@
 
 from datetime import date, timedelta
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import websocket_api
 from homeassistant.components.frontend import DATA_EXTRA_MODULE_URL, add_extra_js_url
@@ -59,6 +59,9 @@ from .coordinator import (
     filter_departures,
 )
 from .schedules import build_timetable, calendar_end
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.device_registry import DeviceEntry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -394,7 +397,7 @@ def _timetable(
 
 
 async def async_remove_config_entry_device(
-    hass: HomeAssistant, entry: NaolibConfigEntry, device: dr.DeviceEntry
+    hass: HomeAssistant, entry: NaolibConfigEntry, device: "DeviceEntry"
 ) -> bool:
     """Allow deleting a nearby stop of an "around me" entry, to hide it.
 
