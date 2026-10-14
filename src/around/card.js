@@ -124,6 +124,6 @@ export class NaolibAroundCard extends NaolibBaseCard {
 
     getCardSize() {
         const stops = prepareStops(this._data?.stops, this.config);
-        return 1 + stops.reduce((size, stop) => size + 1 + stop.departures.length, 0);
+        return 1 + stops.reduce((size, stop) => size + 1 + stop.directions.length, 0);
     }
 }

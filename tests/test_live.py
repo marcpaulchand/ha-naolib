@@ -104,6 +104,8 @@ async def test_the_stops_follow_the_entity(hass: HomeAssistant, hass_ws_client) 
 
         # Moving away from every stop empties the list once debounced.
         _at(hass, 0.0, 0.0)
+        # Older Home Assistant versions deliver the move a loop iteration later.
+        await hass.async_block_till_done()
         async_fire_time_changed(
             hass, dt_util.utcnow() + timedelta(seconds=AROUND_DEBOUNCE + 1)
         )
@@ -170,6 +172,8 @@ async def test_small_moves_update_the_distances(
 
         _at(hass, _LAT + 0.0002, _LON)
         _at(hass, _LAT + 0.0004, _LON)  # cancels the pending recomputation
+        # Older Home Assistant versions deliver the move a loop iteration later.
+        await hass.async_block_till_done()
         async_fire_time_changed(
             hass, dt_util.utcnow() + timedelta(seconds=AROUND_DEBOUNCE + 1)
         )
@@ -202,6 +206,8 @@ async def test_unsubscribing_cancels_a_pending_move(
         subscription = (await client.receive_json())["id"]
         await client.receive_json()
         _at(hass, 0.0, 0.0)  # starts the debounce
+        # Older Home Assistant versions deliver the move a loop iteration later.
+        await hass.async_block_till_done()
         await client.send_json_auto_id(
             {"type": "unsubscribe_events", "subscription": subscription}
         )

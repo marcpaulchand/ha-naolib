@@ -10,12 +10,20 @@ function timeClass(seconds) {
     return "time";
 }
 
-function departureHtml(departure) {
+// One row per line and terminus, its next passages side by side, the
+// soonest on the left.
+function directionHtml(direction) {
+    const times = direction.seconds
+        .map(
+            (seconds) =>
+                `<div class="${timeClass(seconds)}">${esc(humanizeSeconds(seconds))}</div>`,
+        )
+        .join("");
     return `
         <div class="around-departure">
-            ${lineBadge(departure.line ?? "?")}
-            <div class="around-destination">${esc(departure.destination)}</div>
-            <div class="${timeClass(departure.seconds)}">${esc(humanizeSeconds(departure.seconds))}</div>
+            ${lineBadge(direction.line ?? "?")}
+            <div class="around-destination">${esc(direction.destination)}</div>
+            <div class="around-times">${times}</div>
         </div>
     `;
 }
@@ -24,8 +32,8 @@ function stopHtml(stop) {
     const distance = Number.isFinite(stop.distance)
         ? `<div class="around-distance">${esc(String(stop.distance))} m</div>`
         : "";
-    const departures = stop.departures.length
-        ? stop.departures.map(departureHtml).join("")
+    const departures = stop.directions.length
+        ? stop.directions.map(directionHtml).join("")
         : `<div class="around-empty">Aucun passage prévu</div>`;
     return `
         <div class="around-stop">

@@ -12,7 +12,7 @@ const LABELS = {
     title: "Titre",
     radius: "Rayon (mètres)",
     max_stops: "Nombre maximum d'arrêts",
-    departures: "Départs affichés par arrêt",
+    departures: "Passages affichés par ligne et terminus",
     compact: "Mode compact",
 };
 

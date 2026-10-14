@@ -20,6 +20,10 @@ const STOPS = [
             { line: "1", destination: "Mitterrand", expected_ts: at(-0.5) },
             { line: "1", destination: "Mitterrand", expected_ts: at(2) },
             { line: "C2", destination: "Gare Sud", expected_ts: at(5) },
+            { line: "1", destination: "Mitterrand", expected_ts: at(7) },
+            { line: "1", destination: "Mitterrand", expected_ts: at(15) },
+            { line: "1", destination: "Mitterrand", expected_ts: at(25) },
+            { line: "1", destination: "Jamet", expected_ts: at(4) },
             { line: "2", destination: "Orvault", expected_ts: at(9) },
             { line: "3", destination: "Neustrie", expected_ts: at(12) },
         ],
@@ -59,11 +63,20 @@ describe("normalizeAroundConfig", () => {
 describe("prepareStops", () => {
     const config = normalizeAroundConfig({});
 
-    it("keeps the order and the next departures, dropping the gone ones", () => {
+    it("groups the departures by line and terminus, soonest first", () => {
         const stops = prepareStops(STOPS, config, NOW);
         expect(stops.map((stop) => stop.name)).toEqual(["Commerce", "Bouffay"]);
-        expect(stops[0].departures.map((d) => d.line)).toEqual(["1", "C2", "2"]);
-        expect(stops[0].departures[0].seconds).toBe(120);
+        expect(
+            stops[0].directions.map((d) => `${d.line} ${d.destination}`),
+        ).toEqual(["1 Mitterrand", "1 Jamet", "C2 Gare Sud", "2 Orvault", "3 Neustrie"]);
+        expect(stops[1].directions).toEqual([]);
+    });
+
+    it("keeps the next passages of each direction, dropping the gone ones", () => {
+        const [stop] = prepareStops(STOPS, config, NOW);
+        expect(stop.directions[0].seconds).toEqual([120, 420, 900]);
+        const [two] = prepareStops(STOPS, normalizeAroundConfig({ departures: 2 }), NOW);
+        expect(two.directions[0].seconds).toEqual([120, 420]);
     });
 
     it("copes with nothing", () => {
@@ -79,6 +92,15 @@ describe("rendering", () => {
         expect(html).toContain("Gare Sud");
         expect(html).toContain("2 mn");
         expect(html).toContain("Aucun passage prévu");
+    });
+
+    it("puts the passages of a direction side by side, soonest first", () => {
+        const html = renderAround(prepareStops(STOPS, normalizeAroundConfig({}), NOW));
+        const row = html.slice(html.indexOf("Mitterrand"), html.indexOf("Jamet"));
+        expect(row).toContain('class="around-times"');
+        expect(row.indexOf("2 mn")).toBeLessThan(row.indexOf("7 mn"));
+        expect(row.indexOf("7 mn")).toBeLessThan(row.indexOf("15 mn"));
+        expect(row).not.toContain("25 mn");
     });
 
     it("explains an unknown position or no stop around", () => {

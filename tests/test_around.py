@@ -51,6 +51,16 @@ def _entry() -> MockConfigEntry:
     )
 
 
+async def _move(hass: HomeAssistant, lat: float, lon: float) -> None:
+    """Move the tracked entity and let the integration see the move.
+
+    Older Home Assistant versions deliver the state change in a later loop
+    iteration, so the debounce timer only exists once the loop has run.
+    """
+    _at(hass, lat, lon)
+    await hass.async_block_till_done()
+
+
 def _at(hass: HomeAssistant, lat: float, lon: float) -> None:
     """Place the tracked entity at a location."""
     hass.states.async_set(_TRACKER, "not_home", {"latitude": lat, "longitude": lon})
@@ -109,7 +119,7 @@ async def test_moving_away_removes_the_sensors(hass: HomeAssistant) -> None:
     assert _own_stops(coordinator, entry)
 
     with _patch_api():
-        _at(hass, 0.0, 0.0)
+        await _move(hass, 0.0, 0.0)
         async_fire_time_changed(
             hass, dt_util.utcnow() + timedelta(seconds=AROUND_DEBOUNCE + 1)
         )
@@ -208,7 +218,7 @@ async def test_unload_cancels_a_pending_recomputation(hass: HomeAssistant) -> No
     entry = _entry()
     await _setup(hass, entry)
 
-    _at(hass, 0.0, 0.0)  # schedules a debounced recomputation
+    await _move(hass, 0.0, 0.0)  # schedules a debounced recomputation
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
 
@@ -257,7 +267,7 @@ async def test_sensors_expose_the_source_and_distance(hass: HomeAssistant) -> No
 
     # A small move keeps the same stops but changes their distance.
     with _patch_api():
-        _at(hass, _LAT + 0.001, _LON)
+        await _move(hass, _LAT + 0.001, _LON)
         async_fire_time_changed(
             hass, dt_util.utcnow() + timedelta(seconds=AROUND_DEBOUNCE + 1)
         )

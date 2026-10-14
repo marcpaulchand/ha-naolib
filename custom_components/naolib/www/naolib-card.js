@@ -63,10 +63,12 @@ var around = `
     .around-departure { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
     .around-departure .badge { margin-right: 0; }
     .around-destination { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .around-times { display: flex; gap: 4px; flex-shrink: 0; }
     .around-empty { font-size: 0.85em; font-style: italic; color: var(--secondary-text-color); }
     :host([compact]) .around { padding: 0 12px 8px; }
     :host([compact]) .around-stop { padding: 4px 0; }
     :host([compact]) .around-departure { padding: 1px 0; }
+    :host([compact]) .around-times .time { padding: 2px 6px; }
 `;
 
 // src/styles/base.js
@@ -82,7 +84,12 @@ var base = `
         --naolib-scroll-thumb: rgba(127, 127, 127, 0.35);
         --naolib-scroll-thumb-hover: rgba(127, 127, 127, 0.55);
     }
-    ha-card { padding-bottom: 0; overflow: hidden; }
+    /* Keep to the height the dashboard gives the card (rows in a sections
+       view) and scroll the content inside it; an auto height still follows
+       the content. */
+    :host { display: block; height: 100%; }
+    ha-card { padding-bottom: 0; overflow: hidden; height: 100%; display: flex; flex-direction: column; box-sizing: border-box; }
+    #content { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--naolib-scroll-thumb) transparent; }
     .card-header { padding: 16px; font-weight: bold; font-size: 1.2em; display: flex; align-items: center; }
     .icon { margin-right: 10px; color: var(--primary-color); }
     .badge { font-weight: bold; padding: 4px 8px; border-radius: 6px; min-width: 25px; text-align: center; margin-right: 12px; font-size: 1.1em; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
@@ -400,7 +407,7 @@ var DEFAULT_AROUND_CONFIG = {
   // meters
   max_stops: 5,
   departures: 3,
-  // per stop
+  // per line and terminus
   compact: false
 };
 var MIN_RADIUS = 100;
@@ -419,15 +426,30 @@ function normalizeAroundConfig(config) {
   };
 }
 function prepareStops(stops, config, now = Date.now()) {
-  return (stops || []).map((stop) => ({
-    name: stop.name || "",
-    distance: Number(stop.distance),
-    departures: (stop.departures || []).map((departure) => ({
-      line: departure.line,
-      destination: departure.destination,
-      seconds: (Date.parse(departure.expected_ts) - now) / 1e3
-    })).filter((departure) => Number.isFinite(departure.seconds)).filter((departure) => departure.seconds >= 0).slice(0, config.departures)
-  }));
+  return (stops || []).map((stop) => {
+    const directions = /* @__PURE__ */ new Map();
+    for (const departure of stop.departures || []) {
+      const seconds = (Date.parse(departure.expected_ts) - now) / 1e3;
+      if (!Number.isFinite(seconds) || seconds < 0) continue;
+      const key = `${departure.line}|${departure.destination}`;
+      if (!directions.has(key)) {
+        directions.set(key, {
+          line: departure.line,
+          destination: departure.destination,
+          seconds: []
+        });
+      }
+      directions.get(key).seconds.push(seconds);
+    }
+    return {
+      name: stop.name || "",
+      distance: Number(stop.distance),
+      directions: [...directions.values()].map((direction) => ({
+        ...direction,
+        seconds: direction.seconds.sort((a, b) => a - b).slice(0, config.departures)
+      })).sort((a, b) => a.seconds[0] - b.seconds[0])
+    };
+  });
 }
 
 // src/lines.js
@@ -563,18 +585,21 @@ function timeClass(seconds) {
   if (minutes <= WARNING_MINUTES) return "time warning";
   return "time";
 }
-function departureHtml(departure) {
+function directionHtml(direction) {
+  const times = direction.seconds.map(
+    (seconds) => `<div class="${timeClass(seconds)}">${esc(humanizeSeconds(seconds))}</div>`
+  ).join("");
   return `
         <div class="around-departure">
-            ${lineBadge(departure.line ?? "?")}
-            <div class="around-destination">${esc(departure.destination)}</div>
-            <div class="${timeClass(departure.seconds)}">${esc(humanizeSeconds(departure.seconds))}</div>
+            ${lineBadge(direction.line ?? "?")}
+            <div class="around-destination">${esc(direction.destination)}</div>
+            <div class="around-times">${times}</div>
         </div>
     `;
 }
 function stopHtml(stop) {
   const distance = Number.isFinite(stop.distance) ? `<div class="around-distance">${esc(String(stop.distance))} m</div>` : "";
-  const departures2 = stop.departures.length ? stop.departures.map(departureHtml).join("") : `<div class="around-empty">Aucun passage prévu</div>`;
+  const departures2 = stop.directions.length ? stop.directions.map(directionHtml).join("") : `<div class="around-empty">Aucun passage prévu</div>`;
   return `
         <div class="around-stop">
             <div class="around-stop-header">
@@ -694,7 +719,7 @@ var NaolibAroundCard = class extends NaolibBaseCard {
   }
   getCardSize() {
     const stops = prepareStops(this._data?.stops, this.config);
-    return 1 + stops.reduce((size, stop) => size + 1 + stop.departures.length, 0);
+    return 1 + stops.reduce((size, stop) => size + 1 + stop.directions.length, 0);
   }
 };
 __publicField(NaolibAroundCard, "normalizeConfig", normalizeAroundConfig);
@@ -775,7 +800,7 @@ var LABELS = {
   title: "Titre",
   radius: "Rayon (mètres)",
   max_stops: "Nombre maximum d'arrêts",
-  departures: "Départs affichés par arrêt",
+  departures: "Passages affichés par ligne et terminus",
   compact: "Mode compact"
 };
 var HELPERS = {
@@ -900,6 +925,48 @@ function prepareDepartures(departures2, config, now = Date.now()) {
   return out;
 }
 
+// src/directions.js
+var byLine = (a, b) => a.localeCompare(b, void 0, { numeric: true });
+function directionTermini(schedules, departures2, lines = []) {
+  const wanted = new Set(lines.map(String));
+  const termini = { 1: /* @__PURE__ */ new Map(), 2: /* @__PURE__ */ new Map() };
+  const add = (line, direction, destination) => {
+    line = String(line ?? "");
+    destination = String(destination ?? "").trim();
+    const byDirection = termini[Number(direction)];
+    if (!line || !destination || !byDirection) return;
+    if (wanted.size && !wanted.has(line)) return;
+    if (!byDirection.has(line)) byDirection.set(line, /* @__PURE__ */ new Set());
+    byDirection.get(line).add(destination);
+  };
+  for (const [key, group] of Object.entries(schedules || {})) {
+    const [line, direction] = key.split("|");
+    add(group?.ligne?.numLigne || line, direction, group?.ligne?.direction);
+  }
+  for (const departure of departures2 || []) {
+    add(departure.line, departure.direction, departure.destination);
+  }
+  return termini;
+}
+function directionLabel(termini, direction) {
+  const lines = termini[direction];
+  if (!lines?.size) return `Direction ${direction}`;
+  const linesByTerminus = /* @__PURE__ */ new Map();
+  for (const line of [...lines.keys()].sort(byLine)) {
+    const terminus = [...lines.get(line)].sort().join(" / ");
+    if (!linesByTerminus.has(terminus)) linesByTerminus.set(terminus, []);
+    linesByTerminus.get(terminus).push(line);
+  }
+  return [...linesByTerminus].map(([terminus, names]) => `${names.join(", ")} → ${terminus}`).join(" · ");
+}
+function directionHeading(departures2, direction) {
+  const destinations = new Set(
+    (departures2 || []).filter((item) => item.direction === direction && item.destination).map((item) => String(item.destination).trim())
+  );
+  if (!destinations.size) return `Direction ${direction}`;
+  return `Vers ${[...destinations].sort().join(" · ")}`;
+}
+
 // src/render/departures.js
 function timeClass2(minutes) {
   if (minutes <= URGENT_MINUTES) return "time urgent";
@@ -1002,7 +1069,7 @@ function renderDepartures(departures2, stopCode, config) {
   const sections = [1, 2].filter(
     (direction) => departures2.some((item) => item.direction === direction)
   ).map(
-    (direction) => `<div class="tiles"><div class="tile-group">Direction ${direction}</div>${groupedTiles(departures2, direction, config)}</div>`
+    (direction) => `<div class="tiles"><div class="tile-group">${esc(directionHeading(departures2, direction))}</div>${groupedTiles(departures2, direction, config)}</div>`
   ).join("");
   return `${sections}${footerHtml(stopCode, config)}`;
 }
@@ -1020,14 +1087,14 @@ function renderTimetableHeader(extra = "") {
     `;
 }
 function groupSchedules(schedules, config) {
-  const byLine = /* @__PURE__ */ new Map();
+  const byLine2 = /* @__PURE__ */ new Map();
   for (const key of Object.keys(schedules || {})) {
     const [line, direction] = key.split("|");
     if (!matchesFilters(line, direction, config)) continue;
     const data = schedules[key];
     if (!data) continue;
-    if (!byLine.has(line)) byLine.set(line, { line, directions: [] });
-    byLine.get(line).directions.push({
+    if (!byLine2.has(line)) byLine2.set(line, { line, directions: [] });
+    byLine2.get(line).directions.push({
       key,
       line,
       direction: Number(direction),
@@ -1035,7 +1102,7 @@ function groupSchedules(schedules, config) {
       horaires: data.horaires || {}
     });
   }
-  return [...byLine.values()].sort(
+  return [...byLine2.values()].sort(
     (a, b) => String(a.line).localeCompare(String(b.line), void 0, { numeric: true })
   ).map((group) => ({
     ...group,
@@ -1690,6 +1757,20 @@ var HELPERS3 = {
   max_lines: "Nombre maximum de lignes affichées dans chaque sens. En mode compact, nombre maximum de départs affichés.",
   compact: "Une ligne par départ, sans regroupement par direction."
 };
+var timetablesByStop = /* @__PURE__ */ new Map();
+function directionOptions(hass, config) {
+  const attributes = hass.states[config.entity]?.attributes;
+  const termini = directionTermini(
+    timetablesByStop.get(attributes?.stop_code),
+    attributes?.next_departures,
+    config.lines
+  );
+  return [
+    { value: "0", label: "Les deux" },
+    { value: "1", label: directionLabel(termini, 1) },
+    { value: "2", label: directionLabel(termini, 2) }
+  ];
+}
 function lineOptions(hass, config) {
   const state = hass.states[config.entity];
   const departures2 = state?.attributes?.next_departures || [];
@@ -1733,11 +1814,7 @@ function buildSchema3(hass, config) {
       selector: {
         select: {
           mode: "dropdown",
-          options: [
-            { value: "0", label: "Les deux" },
-            { value: "1", label: "Direction 1" },
-            { value: "2", label: "Direction 2" }
-          ]
+          options: directionOptions(hass, config)
         }
       }
     },
@@ -1778,6 +1855,21 @@ var NaolibCardEditor = class extends NaolibFormEditor {
   }
   fromFormData(config, value) {
     return { ...config, ...value, direction: Number(value.direction ?? 0) };
+  }
+  _render() {
+    this._fetchTimetable();
+    super._render();
+  }
+  // Fetch the stop's timetable once, then draw the form again with it.
+  _fetchTimetable() {
+    const stopCode = this._hass?.states[this._config?.entity]?.attributes?.stop_code;
+    if (!stopCode || timetablesByStop.has(stopCode)) return;
+    timetablesByStop.set(stopCode, void 0);
+    this._hass.callWS({ type: "naolib/get_data", stop_code: stopCode }).then((data) => {
+      timetablesByStop.set(stopCode, data?.schedules || {});
+      super._render();
+    }).catch(() => {
+    });
   }
 };
 __publicField(NaolibCardEditor, "defaults", DEFAULT_CONFIG);
