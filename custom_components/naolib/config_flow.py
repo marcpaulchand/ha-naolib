@@ -2,6 +2,7 @@
 
 from collections import Counter
 import logging
+import math
 from typing import Any
 
 from homeassistant import config_entries
@@ -9,6 +10,7 @@ from homeassistant.config_entries import ConfigEntry, ConfigFlowResult, OptionsF
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     EntitySelector,
     EntitySelectorConfig,
     LocationSelector,
@@ -24,6 +26,7 @@ import voluptuous as vol
 
 from .bike import GbfsUnavailableError, async_fetch_stations
 from .const import (
+    CONF_BACK,
     CONF_ENTRY_TYPE,
     CONF_EXCLUDED_STOPS,
     CONF_LOCATION,
@@ -51,7 +54,7 @@ from .const import (
     MIN_AROUND_RADIUS,
     MIN_UPDATE_INTERVAL,
 )
-from .stops import load_stops, nearby_stops, nearest, normalize, stops_within
+from .stops import load_stops, nearby_stops, nearest, normalize
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,13 +72,9 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._stops: list[dict[str, Any]] = []
         self._stations: list[dict[str, Any]] = []
-        # Where the map opens: the centre of the zone picked on the previous
-        # page, or home.
-        self._map_center: dict[str, float] | None = None
-        # "Around me": the settings of the first page and the stops currently
-        # within the radius, offered for removal on the second page.
-        self._around: dict[str, Any] = {}
-        self._candidates: list[dict[str, Any]] = []
+        # Where the stop or station list was reached from, to go back to it.
+        self._stop_origin = "stop"
+        self._station_origin = "bike"
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -92,7 +91,7 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Choose how to look for a transit stop."""
         return self.async_show_menu(
             step_id="stop",
-            menu_options=["by_list", "by_location", "around"],
+            menu_options=["by_list", "by_location", "around", *self._back_option()],
         )
 
     async def async_step_bike(
@@ -101,8 +100,39 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Choose how to look for a bike station."""
         return self.async_show_menu(
             step_id="bike",
-            menu_options=["bike_by_list", "bike_by_location"],
+            menu_options=["bike_by_list", "bike_by_location", *self._back_option()],
         )
+
+    def _back_option(self) -> list[str]:
+        """Offer to go back to the first menu, except when reconfiguring.
+
+        A reconfigured entry keeps its kind, so its flow starts on this menu.
+        """
+        if self.source == config_entries.SOURCE_RECONFIGURE:
+            return []
+        return ["back_to_user"]
+
+    async def async_step_back_to_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Go back to the first menu."""
+        return await self.async_step_user()
+
+    @staticmethod
+    def _with_back(schema: vol.Schema) -> vol.Schema:
+        """Add the switch to go back one step.
+
+        Config flow forms have no back button: the loader turns this switch
+        into one; without it, the switch itself still works.
+        """
+        return schema.extend(
+            {vol.Optional(CONF_BACK, default=False): BooleanSelector()}
+        )
+
+    @staticmethod
+    def _wants_back(user_input: dict[str, Any] | None) -> bool:
+        """Tell whether the form was submitted to go back one step."""
+        return bool(user_input and user_input.get(CONF_BACK))
 
     def _home(self) -> dict[str, float]:
         """Return the home location, where the map opens without a zone."""
@@ -111,61 +141,44 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "longitude": self.hass.config.longitude,
         }
 
-    def _zone_schema(self) -> vol.Schema:
-        """Build the zone page, suggesting the home zone when it exists.
+    def _position_schema(self) -> vol.Schema:
+        """Build the position page: a zone first, then the map.
 
-        A suggested value (rather than a default) lets the user clear it and
-        start the map from home instead.
+        Forms cannot update one field from another; the card module watches
+        this form and moves the marker to the zone when it changes (see
+        src/flow-zone.js). ``_searched_point`` still falls back on the zone if
+        that script is not running.
         """
         schema = vol.Schema(
             {
                 vol.Optional(CONF_ZONE): EntitySelector(
                     EntitySelectorConfig(domain="zone")
                 ),
+                vol.Required(CONF_LOCATION, default=self._home()): LocationSelector(),
             }
         )
+        schema = self._with_back(schema)
         if self.hass.states.get("zone.home") is None:
             return schema
         return self.add_suggested_values_to_schema(schema, {CONF_ZONE: "zone.home"})
 
-    def _map_schema(self) -> vol.Schema:
-        """Build the map page, centred on the zone picked before (or home).
+    def _searched_point(self, user_input: dict[str, Any]) -> tuple[float, float] | None:
+        """Return the point to search around: the marker, or else the zone.
 
-        Forms cannot react to one field from another, which is why the zone
-        and the map are two pages: the map then opens where the zone is.
+        The marker is what the user sees. It only defers to the zone when it
+        was left at home while a zone is picked, i.e. when nothing moved it to
+        the zone. None means that zone has no coordinates.
         """
-        return vol.Schema(
-            {
-                vol.Required(
-                    CONF_LOCATION, default=self._map_center or self._home()
-                ): LocationSelector(),
-            }
-        )
-
-    async def _async_step_zone(
-        self, step_id: str, user_input: dict[str, Any] | None
-    ) -> ConfigFlowResult | None:
-        """Show the zone page, or record where the map should open.
-
-        Returns the form to show, or None once the map centre is known.
-        """
-        schema = self._zone_schema()
-        if user_input is None:
-            return self.async_show_form(step_id=step_id, data_schema=schema)
-
+        location = user_input[CONF_LOCATION]
+        point = (location["latitude"], location["longitude"])
         zone = user_input.get(CONF_ZONE)
-        if not zone:
-            self._map_center = self._home()
-            return None
-        center = self._entity_coords(zone)
-        if center is None:
-            return self.async_show_form(
-                step_id=step_id,
-                data_schema=schema,
-                errors={"base": "zone_without_location"},
-            )
-        self._map_center = {"latitude": center[0], "longitude": center[1]}
-        return None
+        home = self._home()
+        at_home = math.isclose(point[0], home["latitude"], abs_tol=1e-6) and (
+            math.isclose(point[1], home["longitude"], abs_tol=1e-6)
+        )
+        if zone and at_home:
+            return self._entity_coords(zone)
+        return point
 
     async def _async_search_stops(
         self, latitude: float, longitude: float
@@ -199,69 +212,63 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason="no_stops_found")
 
         self._stops = sorted(stops, key=lambda stop: normalize(stop["name"]))
+        self._stop_origin = "stop"
         return await self.async_step_select_stop()
 
     async def async_step_by_location(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Pick a zone to start from; the map opens on it next."""
-        form = await self._async_step_zone("by_location", user_input)
-        return form or await self.async_step_by_location_map()
-
-    async def async_step_by_location_map(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Search the stops around the marker, which starts on the zone."""
-        schema = self._map_schema()
+        """Search the stops around a zone or a point on the map."""
+        schema = self._position_schema()
         if user_input is None:
-            return self.async_show_form(step_id="by_location_map", data_schema=schema)
+            return self.async_show_form(step_id="by_location", data_schema=schema)
+        if self._wants_back(user_input):
+            return await self.async_step_stop()
 
-        location = user_input[CONF_LOCATION]
-        error = await self._async_search_stops(
-            location["latitude"], location["longitude"]
+        point = self._searched_point(user_input)
+        error = (
+            "zone_without_location"
+            if point is None
+            else await self._async_search_stops(*point)
         )
         if error is None:
+            self._stop_origin = "by_location"
             return await self.async_step_select_stop()
         return self.async_show_form(
-            step_id="by_location_map", data_schema=schema, errors={"base": error}
+            step_id="by_location", data_schema=schema, errors={"base": error}
         )
 
     async def async_step_around(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Follow a person/zone/device_tracker and expose the nearby stops."""
-        if user_input is not None:
-            self._around = {
-                CONF_ENTRY_TYPE: ENTRY_TYPE_AROUND,
-                CONF_SOURCE_ENTITY: user_input[CONF_SOURCE_ENTITY],
-                CONF_RADIUS: int(user_input[CONF_RADIUS]),
-                CONF_MAX_STOPS: int(user_input[CONF_MAX_STOPS]),
-                CONF_EXCLUDED_STOPS: self._previous_exclusions(),
-            }
-            coords = self._entity_coords(user_input[CONF_SOURCE_ENTITY])
-            self._candidates = (
-                []
-                if coords is None
-                else await self.hass.async_add_executor_job(
-                    stops_within,
-                    coords[0],
-                    coords[1],
-                    self._around[CONF_RADIUS],
-                    MAX_AROUND_MAX_STOPS,
-                )
+        errors: dict[str, str] = {}
+        if self._wants_back(user_input):
+            return await self.async_step_stop()
+        if user_input is not None and not user_input.get(CONF_SOURCE_ENTITY):
+            errors["base"] = "no_source_entity"
+        elif user_input is not None:
+            source_entity = user_input[CONF_SOURCE_ENTITY]
+            return await self._async_save(
+                unique_id=f"around_{source_entity}",
+                title=f"Autour de : {self._entity_label(source_entity)}",
+                data={
+                    CONF_ENTRY_TYPE: ENTRY_TYPE_AROUND,
+                    CONF_SOURCE_ENTITY: source_entity,
+                    CONF_RADIUS: int(user_input[CONF_RADIUS]),
+                    CONF_MAX_STOPS: int(user_input[CONF_MAX_STOPS]),
+                    # Stops are removed by deleting their device; reconfiguring
+                    # keeps the ones already removed.
+                    CONF_EXCLUDED_STOPS: self._previous_exclusions(),
+                },
             )
-            if not self._candidates:
-                # Nothing to choose from (no position yet, or no stop around):
-                # keep the exclusions as they are.
-                return await self._async_save_around()
-            return await self.async_step_around_stops()
 
         defaults = self._around_defaults()
         schema = vol.Schema(
             {
-                vol.Required(
-                    CONF_SOURCE_ENTITY, default=defaults[CONF_SOURCE_ENTITY]
-                ): EntitySelector(
+                # Optional and only suggested: an empty default is not a valid
+                # entity, and the form must be sendable empty to go back.
+                vol.Optional(CONF_SOURCE_ENTITY): EntitySelector(
                     EntitySelectorConfig(domain=["person", "zone", "device_tracker"])
                 ),
                 vol.Required(
@@ -287,58 +294,13 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ),
             }
         )
-        return self.async_show_form(step_id="around", data_schema=schema)
-
-    async def async_step_around_stops(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Untick the nearby stops that should never be shown."""
-        excluded = set(self._around[CONF_EXCLUDED_STOPS])
-        if user_input is not None:
-            kept = set(user_input.get("stops", []))
-            offered = {stop["id"] for stop in self._candidates}
-            # Exclusions of stops not offered now (far from here) are kept.
-            self._around[CONF_EXCLUDED_STOPS] = sorted(
-                (excluded - offered) | (offered - kept)
+        if defaults[CONF_SOURCE_ENTITY]:
+            schema = self.add_suggested_values_to_schema(
+                schema, {CONF_SOURCE_ENTITY: defaults[CONF_SOURCE_ENTITY]}
             )
-            return await self._async_save_around()
-
-        options = [
-            SelectOptionDict(
-                value=stop["id"], label=f"{stop['name']} ({stop['distance']} m)"
-            )
-            for stop in self._candidates
-        ]
-        return self.async_show_form(
-            step_id="around_stops",
-            data_schema=vol.Schema(
-                {
-                    vol.Optional(
-                        "stops",
-                        default=[
-                            stop["id"]
-                            for stop in self._candidates
-                            if stop["id"] not in excluded
-                        ],
-                    ): SelectSelector(
-                        SelectSelectorConfig(
-                            options=options,
-                            multiple=True,
-                            mode=SelectSelectorMode.LIST,
-                        )
-                    ),
-                }
-            ),
-        )
-
-    async def _async_save_around(self) -> ConfigFlowResult:
-        """Create (or update) the "around me" entry from the collected data."""
-        source_entity = self._around[CONF_SOURCE_ENTITY]
-        return await self._async_save(
-            unique_id=f"around_{source_entity}",
-            title=f"Autour de : {self._entity_label(source_entity)}",
-            data=self._around,
-        )
+        if self.source != config_entries.SOURCE_RECONFIGURE:
+            schema = self._with_back(schema)
+        return self.async_show_form(step_id="around", data_schema=schema, errors=errors)
 
     def _previous_exclusions(self) -> list[str]:
         """Return the stops excluded by the entry being reconfigured, if any."""
@@ -399,43 +361,42 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._stations = sorted(
             stations, key=lambda station: normalize(station["name"])
         )
+        self._station_origin = "bike"
         return await self.async_step_select_station()
 
     async def async_step_bike_by_location(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Pick a zone to start from; the map opens on it next."""
-        form = await self._async_step_zone("bike_by_location", user_input)
-        return form or await self.async_step_bike_by_location_map()
-
-    async def async_step_bike_by_location_map(
-        self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
-        """Search the bike stations around the marker."""
-        schema = self._map_schema()
+        """Search the bike stations around a zone or a point on the map."""
+        schema = self._position_schema()
         if user_input is None:
-            return self.async_show_form(
-                step_id="bike_by_location_map", data_schema=schema
-            )
+            return self.async_show_form(step_id="bike_by_location", data_schema=schema)
+        if self._wants_back(user_input):
+            return await self.async_step_bike()
 
-        location = user_input[CONF_LOCATION]
-        error = await self._async_search_stations(
-            location["latitude"], location["longitude"]
+        point = self._searched_point(user_input)
+        error = (
+            "zone_without_location"
+            if point is None
+            else await self._async_search_stations(*point)
         )
         if error is None:
+            self._station_origin = "bike_by_location"
             return await self.async_step_select_station()
         return self.async_show_form(
-            step_id="bike_by_location_map", data_schema=schema, errors={"base": error}
+            step_id="bike_by_location", data_schema=schema, errors={"base": error}
         )
 
     async def async_step_select_station(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Choose a bike station among the ones just found."""
+        if self._wants_back(user_input):
+            return await getattr(self, f"async_step_{self._station_origin}")()
         station = (
             None
             if user_input is None
-            else _find(self._stations, user_input[CONF_STATION_ID])
+            else _find(self._stations, user_input.get(CONF_STATION_ID))
         )
         if station is None:
             return self._show_selection(
@@ -473,10 +434,12 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Choose a stop among the ones just found."""
+        if self._wants_back(user_input):
+            return await getattr(self, f"async_step_{self._stop_origin}")()
         stop = (
             None
             if user_input is None
-            else _find(self._stops, user_input[CONF_STOP_CODE])
+            else _find(self._stops, user_input.get(CONF_STOP_CODE))
         )
         if stop is None:
             return self._show_selection(
@@ -514,16 +477,19 @@ class NaolibConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         ]
         return self.async_show_form(
             step_id=step_id,
-            data_schema=vol.Schema(
-                {
-                    vol.Required(key): SelectSelector(
-                        SelectSelectorConfig(
-                            options=options,
-                            mode=SelectSelectorMode.DROPDOWN,
-                            custom_value=True,
-                        )
-                    ),
-                }
+            # Optional, so the form can be sent back without a selection.
+            data_schema=self._with_back(
+                vol.Schema(
+                    {
+                        vol.Optional(key): SelectSelector(
+                            SelectSelectorConfig(
+                                options=options,
+                                mode=SelectSelectorMode.DROPDOWN,
+                                custom_value=True,
+                            )
+                        ),
+                    }
+                )
             ),
             errors={"base": "not_in_list"} if user_input is not None else None,
         )
@@ -608,7 +574,7 @@ def _labels(places: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     }
 
 
-def _find(places: list[dict[str, Any]], value: str) -> dict[str, Any] | None:
+def _find(places: list[dict[str, Any]], value: str | None) -> dict[str, Any] | None:
     """Return the offered place picked by its label (or its id), if any."""
     by_label = _labels(places)
     if value in by_label:
