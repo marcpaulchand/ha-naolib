@@ -56,14 +56,15 @@ install, copy `custom_components/naolib` into `config/custom_components` and res
 
 Add the **Naolib** integration, choose what to track — **a stop** (bus, tram, ferry) or **a
 bike station** — then pick it from the list of the whole network (type a few letters to
-filter it), or search around a position: a **zone** (such as your home), or a point on the
-**map** (your home coordinates are pre-filled). Moving the marker takes precedence over the
-zone; distances are shown.
+filter it), or search around a position: pick a **zone** (your home zone is suggested), and
+the **map** then opens on it so you can fine-tune the marker. Distances are shown.
 
 A stop can also be tracked **around me**: pick a **person, zone or device tracker**, and the
 stops within a radius become sensors on their own, recomputed as the entity moves — so a
 phone's tracker turns into a live "stops near me" list. All of them read from the same shared
 network request, so following many stops still costs a single call.
+A second page lists the stops currently in the radius: untick the ones you never want, and
+the next closest stop takes their place.
 
 Entities are created right away; repeat to follow several stops or stations. The refresh
 interval (60 s by default, 30 to 600 s) is set from the **Configure** button. Deleting an
