@@ -2,10 +2,12 @@
 
 After an update, Home Assistant's service worker or the mobile apps can keep
 an old page, hence an old versioned loader URL and an outdated card, until
-their frontend cache is reset by hand. The loader is served at a fixed URL,
-uncached, with the card's content hash stamped in: an outdated page still
-runs the current loader, which imports the card under a URL that changes
-with its content.
+their frontend cache is reset by hand. The loader is served at a fixed URL
+under /api/, which the service worker always fetches from the network (it
+serves any other URL from its cache first, whatever the cache headers say),
+with the card's content hash stamped in: an outdated page still runs the
+current loader, which imports the card under a URL that changes with its
+content.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from homeassistant.core import HomeAssistant
 _LOGGER = logging.getLogger(__name__)
 
 WWW_PATH = Path(__file__).parent / "www"
-LOADER_URL = "/naolib_loader.js"
+LOADER_URL = "/api/naolib/loader.js"
 CARD_FILENAME = "naolib-card.js"
 # Placeholder of the loader bundle, replaced by the card's hash when served.
 CARD_HASH_PLACEHOLDER = "__NAOLIB_CARD_HASH__"

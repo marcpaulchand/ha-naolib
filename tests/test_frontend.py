@@ -43,7 +43,7 @@ async def test_the_loader_is_served_uncached_with_the_card_hash(
         await hass.async_block_till_done()
 
     client = await hass_client()
-    response = await client.get("/naolib_loader.js")
+    response = await client.get("/api/naolib/loader.js")
     body = await response.text()
 
     assert response.status == 200
